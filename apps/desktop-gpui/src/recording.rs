@@ -1283,7 +1283,7 @@ impl ActiveRecording {
                         Some(upload) => {
                             mark_instant_recording_stopped(&self.project_dir, upload.metadata_lock())
                         }
-                        None => Err(anyhow!("instant recording has no upload session")),
+                        None => mark_instant_recording_stopped(&self.project_dir, &Mutex::new(())),
                     };
                     if let Err(error) = &metadata_result {
                         tracing::warn!(%error, "Could not mark the instant recording as stopped");
@@ -1291,9 +1291,6 @@ impl ActiveRecording {
                     let mut completed = stopped?;
                     metadata_result?;
                     let project_path = completed.project_path.clone();
-                    let upload = instant_upload
-                        .as_mut()
-                        .ok_or_else(|| anyhow!("instant recording has no upload session"))?;
 
                     let display_dir = project_path.join("content/display");
                     let audio_dir = project_path.join("content/audio");
@@ -1326,7 +1323,14 @@ impl ActiveRecording {
                         return Err(anyhow!("instant recording has no finalized output"));
                     }
 
-                    persist_instant_meta(&completed, upload.video(), upload.metadata_lock())?;
+                    match instant_upload.as_ref() {
+                        Some(upload) => persist_instant_meta(
+                            &completed,
+                            Some(upload.video()),
+                            upload.metadata_lock(),
+                        )?,
+                        None => persist_instant_meta(&completed, None, &Mutex::new(()))?,
+                    }
 
                     // The Tauri app builds the instant thumbnail by concatenating
                     // `content/display`'s init segment with the first media
@@ -1979,7 +1983,7 @@ fn apply_camera_preview_to_project_config(
 /// this pair of files the recording plays but no Cap surface lists it.
 fn persist_instant_meta(
     completed: &instant_recording::CompletedRecording,
-    upload: &cap_project::VideoUploadInfo,
+    upload: Option<&cap_project::VideoUploadInfo>,
     metadata_lock: &Mutex<()>,
 ) -> anyhow::Result<()> {
     with_instant_metadata_lock(metadata_lock, || {
@@ -2009,7 +2013,7 @@ fn persist_instant_meta(
             platform: Some(Platform::default()),
             project_path: completed.project_path.clone(),
             pretty_name,
-            sharing: Some(cap_project::SharingMeta {
+            sharing: upload.map(|upload| cap_project::SharingMeta {
                 id: upload.id.clone(),
                 link: upload.link.clone(),
                 content_hash: None,
@@ -2108,25 +2112,27 @@ pub(crate) fn persist_instant_upload_complete(
 
 fn persist_in_progress_instant_meta(
     project_path: &std::path::Path,
-    video: &cap_project::VideoUploadInfo,
+    video: Option<&cap_project::VideoUploadInfo>,
     segmented: bool,
     metadata_lock: &Mutex<()>,
 ) -> anyhow::Result<()> {
     with_instant_metadata_lock(metadata_lock, || {
-        let upload = if segmented {
-            cap_project::UploadMeta::SegmentUpload {
-                video_id: video.id.clone(),
-                pre_created_video: video.clone(),
-                recording_dir: project_path.to_path_buf(),
+        let upload = video.map(|video| {
+            if segmented {
+                cap_project::UploadMeta::SegmentUpload {
+                    video_id: video.id.clone(),
+                    pre_created_video: video.clone(),
+                    recording_dir: project_path.to_path_buf(),
+                }
+            } else {
+                cap_project::UploadMeta::MultipartUpload {
+                    video_id: video.id.clone(),
+                    file_path: project_path.join("content/output.mp4"),
+                    pre_created_video: video.clone(),
+                    recording_dir: project_path.to_path_buf(),
+                }
             }
-        } else {
-            cap_project::UploadMeta::MultipartUpload {
-                video_id: video.id.clone(),
-                file_path: project_path.join("content/output.mp4"),
-                pre_created_video: video.clone(),
-                recording_dir: project_path.to_path_buf(),
-            }
-        };
+        });
         let pretty_name = project_path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -2142,7 +2148,7 @@ fn persist_in_progress_instant_meta(
             inner: cap_project::RecordingMetaInner::Instant(
                 cap_project::InstantRecordingMeta::InProgress { recording: true },
             ),
-            upload: Some(upload),
+            upload,
         };
         save_instant_metadata(&meta)?;
         Ok(())
@@ -2238,39 +2244,8 @@ async fn start_internal(
     if matches!(config.target, ScreenCaptureTarget::CameraOnly) && config.camera.is_none() {
         return Err(anyhow!("Camera-only recording requires a selected camera."));
     }
-    if config.mode == RecordingMode::Instant && !crate::store::auth_snapshot().signed_in() {
-        return Err(anyhow!("Please sign in to use instant recording"));
-    }
-
     let project_dir = create_project_dir(&config.target, config.mode)?;
-    let project_name = project_dir
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Cap Recording")
-        .to_string();
-    let organization_id = crate::store::store_section(crate::store::RECORDING_SETTINGS)
-        .get("organizationId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|organization| !organization.is_empty())
-        .map(str::to_string);
-
-    let pre_created_video = if config.mode == RecordingMode::Instant {
-        let video = crate::upload::prepare_instant_upload(
-            matches!(config.target, ScreenCaptureTarget::CameraOnly),
-            project_name,
-            organization_id,
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        crate::upload::instant_cleanup::begin(&video.id, &project_dir);
-        #[cfg(target_os = "linux")]
-        if let Some(attempt) = &attempt {
-            *attempt.0.video.lock().unwrap() = Some((video.id.clone(), project_dir.clone()));
-        }
-        Some(video)
-    } else {
-        None
-    };
+    let pre_created_video: Option<cap_project::VideoUploadInfo> = None;
 
     let result = start_attempt_with_upload(
         config,
@@ -2471,14 +2446,7 @@ async fn start_attempt_with_upload(
         out_of_process_muxer: settings.out_of_process_muxer,
         instant_mode_max_resolution: cap_recording::DEFAULT_INSTANT_MODE_MAX_RESOLUTION,
     };
-    // The instant output cap is plan-gated at start time, not at settings
-    // time (`recording.rs:1634-1639`): free stays at the free cap even if a
-    // stale store value says otherwise.
-    let instant_max_resolution = if crate::store::auth_snapshot().is_upgraded() {
-        settings.instant_mode_max_resolution
-    } else {
-        cap_recording::FREE_INSTANT_MODE_MAX_RESOLUTION
-    };
+    let instant_max_resolution = settings.instant_mode_max_resolution;
 
     #[cfg(target_os = "macos")]
     let excluded_windows = {
@@ -2576,13 +2544,15 @@ async fn start_attempt_with_upload(
                     .context("instant recording actor")?,
             );
             let setup = (|| {
-                let video = pre_created_video
-                    .ok_or_else(|| anyhow!("instant recording has no reserved upload"))?;
+                let Some(video) = pre_created_video else {
+                    persist_in_progress_instant_meta(&project_dir, None, false, &Mutex::new(()))?;
+                    return Ok(None);
+                };
                 let segment_rx = handle.take_segment_rx();
                 let metadata_lock = Arc::new(Mutex::new(()));
                 persist_in_progress_instant_meta(
                     &project_dir,
-                    &video,
+                    Some(&video),
                     segment_rx.is_some(),
                     &metadata_lock,
                 )?;
@@ -2600,11 +2570,12 @@ async fn start_attempt_with_upload(
                     metadata_lock,
                     Some(crate::upload::CompletionAuthorization::new()),
                 )
+                .map(Some)
                 .map_err(anyhow::Error::msg)
             })();
             #[cfg(windows)]
             let setup = finish_windows_startup_setup(setup, handle.cancel()).await;
-            instant_upload = Some(setup?);
+            instant_upload = setup?;
             Handle::Instant(handle)
         }
     };
@@ -3214,7 +3185,7 @@ mod tests {
                 id: "revoked".into(),
             },
         };
-        persist_in_progress_instant_meta(&dir, &video, true, &metadata_lock).unwrap();
+        persist_in_progress_instant_meta(&dir, Some(&video), true, &metadata_lock).unwrap();
         let original = std::fs::read(dir.join("recording-meta.json")).unwrap();
         let cancel = AtomicBool::new(false);
         let (response, received) = tokio::sync::oneshot::channel();
@@ -3711,7 +3682,7 @@ mod tests {
             },
         };
         let metadata_lock = Mutex::new(());
-        persist_in_progress_instant_meta(&dir, &video, true, &metadata_lock).unwrap();
+        persist_in_progress_instant_meta(&dir, Some(&video), true, &metadata_lock).unwrap();
         crate::upload::queue::record_capture(&dir, &video, true, true).unwrap();
         persist_instant_upload_failure(&dir, "offline", &metadata_lock).unwrap();
         let meta = cap_project::RecordingMeta::load_for_project(&dir).unwrap();
@@ -3770,7 +3741,7 @@ mod tests {
                             link: "https://example.invalid/s/test".into(),
                             config: cap_project::S3UploadMeta { id: "test".into() },
                         };
-                        persist_instant_meta(&completed, &video, &stopped_lock)
+                        persist_instant_meta(&completed, Some(&video), &stopped_lock)
                     } else {
                         mark_instant_recording_stopped(&stopped_dir, &stopped_lock)
                     }

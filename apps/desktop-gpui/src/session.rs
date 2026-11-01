@@ -1385,6 +1385,9 @@ impl RecordingSession {
                             }
                             this.finished_instant = !low_storage;
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+                        } else if this.mode() == Some(crate::recording::RecordingMode::Instant) && !low_storage {
+                            crate::library::reveal_path(&project_dir.join("content/output.mp4"), cx);
+                            this.finished_instant = true;
                         }
                     }
                     Ok(Err(error)) => {

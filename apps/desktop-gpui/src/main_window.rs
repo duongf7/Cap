@@ -2395,17 +2395,6 @@ impl MainWindow {
                 None => return,
             }
         };
-        if mode == recording::RecordingMode::Instant && !crate::store::auth_snapshot().signed_in() {
-            let kind = match &target {
-                ScreenCaptureTarget::Display { .. } => TargetType::Display,
-                ScreenCaptureTarget::Window { .. } => TargetType::Window,
-                ScreenCaptureTarget::Area { .. } => TargetType::Area,
-                ScreenCaptureTarget::CameraOnly => TargetType::CameraOnly,
-            };
-            self.show_sign_in_prompt(kind, cx);
-            cx.defer(app_windows::show_main_window);
-            return;
-        }
         if matches!(target, ScreenCaptureTarget::CameraOnly) && self.camera.is_none() {
             self.session.update(cx, |session, cx| {
                 session.error = Some(tr::main::error::camera_only_needs_camera().into());
