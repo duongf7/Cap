@@ -485,18 +485,31 @@ pub fn target_to_display_and_crop(
                     .raw_handle()
                     .physical_position()
                     .ok_or_else(|| anyhow!("No display bounds"))?;
+                let display_size = display
+                    .physical_size()
+                    .ok_or_else(|| anyhow!("No display size"))?;
                 let raw_window_bounds = window
                     .raw_handle()
                     .physical_bounds()
                     .ok_or_else(|| anyhow!("No window bounds"))?;
 
-                Some(PhysicalBounds::new(
-                    PhysicalPosition::new(
-                        raw_window_bounds.position().x() - raw_display_position.x(),
-                        raw_window_bounds.position().y() - raw_display_position.y(),
-                    ),
-                    raw_window_bounds.size(),
-                ))
+                // A maximized window with a custom frame (AutoCAD, Revit)
+                // reports bounds 8px past every display edge. The capturer
+                // drops each frame whose crop box leaves the display surface,
+                // so an unclamped crop records nothing.
+                Some(
+                    clamp_crop_to_display(
+                        PhysicalBounds::new(
+                            PhysicalPosition::new(
+                                raw_window_bounds.position().x() - raw_display_position.x(),
+                                raw_window_bounds.position().y() - raw_display_position.y(),
+                            ),
+                            raw_window_bounds.size(),
+                        ),
+                        display_size,
+                    )
+                    .ok_or_else(|| anyhow!("Window is not visible on its display"))?,
+                )
             }
 
             #[cfg(target_os = "linux")]
@@ -570,6 +583,75 @@ pub fn target_to_display_and_crop(
     };
 
     Ok((display, crop_bounds))
+}
+
+#[cfg(any(windows, test))]
+fn clamp_crop_to_display(
+    bounds: scap_targets::bounds::PhysicalBounds,
+    display_size: scap_targets::bounds::PhysicalSize,
+) -> Option<scap_targets::bounds::PhysicalBounds> {
+    use scap_targets::bounds::{PhysicalBounds, PhysicalPosition, PhysicalSize};
+
+    let left = bounds.position().x().max(0.0);
+    let top = bounds.position().y().max(0.0);
+    let right = (bounds.position().x() + bounds.size().width()).min(display_size.width());
+    let bottom = (bounds.position().y() + bounds.size().height()).min(display_size.height());
+    (right > left && bottom > top).then(|| {
+        PhysicalBounds::new(
+            PhysicalPosition::new(left, top),
+            PhysicalSize::new(right - left, bottom - top),
+        )
+    })
+}
+
+#[cfg(test)]
+mod clamp_crop_tests {
+    use super::clamp_crop_to_display;
+    use scap_targets::bounds::{PhysicalBounds, PhysicalPosition, PhysicalSize};
+
+    fn bounds(x: f64, y: f64, width: f64, height: f64) -> PhysicalBounds {
+        PhysicalBounds::new(
+            PhysicalPosition::new(x, y),
+            PhysicalSize::new(width, height),
+        )
+    }
+
+    #[test]
+    fn maximized_window_overhang_is_trimmed_to_the_display() {
+        let clamped = clamp_crop_to_display(
+            bounds(-8.0, -8.0, 1936.0, 1096.0),
+            PhysicalSize::new(1920.0, 1080.0),
+        )
+        .unwrap();
+        assert_eq!(clamped.position().x(), 0.0);
+        assert_eq!(clamped.position().y(), 0.0);
+        assert_eq!(clamped.size().width(), 1920.0);
+        assert_eq!(clamped.size().height(), 1080.0);
+    }
+
+    #[test]
+    fn window_inside_the_display_is_unchanged() {
+        let clamped = clamp_crop_to_display(
+            bounds(100.0, 50.0, 800.0, 600.0),
+            PhysicalSize::new(1920.0, 1080.0),
+        )
+        .unwrap();
+        assert_eq!(clamped.position().x(), 100.0);
+        assert_eq!(clamped.position().y(), 50.0);
+        assert_eq!(clamped.size().width(), 800.0);
+        assert_eq!(clamped.size().height(), 600.0);
+    }
+
+    #[test]
+    fn window_off_the_display_has_no_crop() {
+        assert!(
+            clamp_crop_to_display(
+                bounds(2000.0, 0.0, 800.0, 600.0),
+                PhysicalSize::new(1920.0, 1080.0)
+            )
+            .is_none()
+        );
+    }
 }
 
 /// Locates the recording display's physical notch within the frames this target
